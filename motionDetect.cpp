@@ -145,7 +145,7 @@ bool checkMotion(camera_fb_t* fb, bool motionStatus) {
     showDebug("diffPcnt %0.2f%%, lux %u%%, %ums", diffPcnt, lightLevel, millis()-cTime);
 
     // determine if movement has occurred
-    if (diffPcnt > (float)motionVal/10.0) { //  min % shift to indicate movement
+    if (diffPcnt > (float)motionVal/30.0) { //  min % shift to indicate movement
       // sufficient centre of mass shift
       if (!motionStatus) motionCnt += 1;
       showDebug("### Change detected");
