@@ -12,7 +12,7 @@ bool debug = true;
 uint8_t fsizePtr = THIS_FRAME; // framesize selection
 uint8_t lightLevel; // Current ambient light level 
 uint8_t nightSwitch = 10; // white level % for night/day switching
-uint8_t motionVal = 10; // motion sensitivity setting
+uint8_t motionVal = 7; // motion sensitivity difference setting
 bool haveMotion = false;
 
 struct frameStruct {
