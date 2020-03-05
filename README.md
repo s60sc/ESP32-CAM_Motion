@@ -40,8 +40,9 @@ The following monitoring parameters can be modified:
 * `#define NIGHT_SEQUENCE 100` The number of sequential dark frames that constitute night time
 
 The web page in [ESP32-CAM_MJPEG2SD](https://github.com/s60sc/ESP32-CAM_MJPEG2SD) includes additional options:
-* __Motion Sensitivity__ sets how much centre of mass shift is needed to constitute a movement. The faster that frames are received the lower the value should be for more sensitivity
+* __Motion Sensitivity__ sets how much centre of mass shift is needed to constitute a movement. The faster that frames are received the higher the value should be for more sensitivity
 * __Night Switch__ sets the ambient light level that constitutes night time. __Ambient Light__ displays the current light level
 
 The file `mjpeg2sd.cpp` in [ESP32-CAM_MJPEG2SD](https://github.com/s60sc/ESP32-CAM_MJPEG2SD) has the parameter:
 * `#define POST_MOTION_TIME 2` which sets the number of seconds the recording continues after motion stop.
+
