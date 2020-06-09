@@ -16,11 +16,12 @@
  s60sc 2020
  
 */
-#include <motion.h>
-#include <esp_camera.h>
-#include <esp_jpg_decode.h>
+#include "motion.h"
+#include "esp_camera.h"
+#include "esp_jpg_decode.h"
 #include <SD_MMC.h>
 
+#include "math.h"
 
 
 // user configuration parameters for calibrating motion detection
@@ -33,15 +34,25 @@
 #define BMP_HEADER 54 // size of BMP header bytes
 
 // auto newline printf
-#define showInfo(format, ...) Serial.printf(format "\n", ##__VA_ARGS__)
-#define showError(format, ...) Serial.printf("ERROR: " format "\n", ##__VA_ARGS__)
-#define showDebug(format, ...) if (debug) Serial.printf("DEBUG: " format "\n", ##__VA_ARGS__)
+#define SerialPrintf(format, ...) {\
+    Serial.printf(format, ##__VA_ARGS__);\
+    Serial.println("");\
+    } 
+#define showInfo(format, ...) SerialPrintf(format, ##__VA_ARGS__)
+#define showError(format, ...) SerialPrintf("ERROR: " format, ##__VA_ARGS__)
+#define showDebug(format, ...) if (debug) SerialPrintf("DEBUG: " format, ##__VA_ARGS__)
 
 /********* the following must be declared and initialised elsewhere **********/
 extern bool debug;
 extern uint8_t fsizePtr;
 extern uint8_t lightLevel; // Current ambient light level 
 extern uint8_t motionVal; // motion sensitivity setting
+
+// 1600>>2 = 400 ; 1200 >> 2 = 300
+// TODO : be able to allocate more  : 400 x 300
+static uint8_t PROGMEM prevGrayIm[43000] = {0};
+static MotionEstContext* me_ctx = new MotionEstContext();
+static bool first = true;
 
 struct frameStruct {
   const char* frameSizeStr;
@@ -56,6 +67,20 @@ extern const frameStruct frameData[];
 /**********************************************************************************/
 
 static bool jpg2rgb(const uint8_t *src, size_t src_len, uint8_t ** out, size_t * out_len, uint8_t scale, uint8_t bmpOffset);
+
+static void bmp2gray(uint8_t *gray, uint8_t *bmpBuf, size_t numCols, size_t numRows,
+        int pixelSpan, int bitmapWidth) {
+    for (int r=0; r<numRows; r++) {
+      for (int c=0; c<numCols; c++) {
+        *(gray++) = (19595 * *(bmpBuf)            // R 
+                   + 38469 * *(bmpBuf + 1)         // G
+                    + 7472 * *(bmpBuf + 2)) >> 16;  // B
+        bmpBuf += pixelSpan;
+      }  
+      // same as pixelPos = (c*pixelSpan+r*bitmapWidth*pixelSpan)
+      bmpBuf += bitmapWidth * pixelSpan;  // r*bitmapWidth + c
+    }
+}
 
 bool checkMotion(camera_fb_t* fb, bool motionStatus) {
   // get current frame and calculate centre of mass, then compare with previous
@@ -72,95 +97,76 @@ bool checkMotion(camera_fb_t* fb, bool motionStatus) {
     bmpFile.close(); 
     showDebug("wrote BMP to SD");
   }
-  
   if (converted) {       
-    showDebug("Jpeg to bitmap conversion time %ums", millis()-mTime); 
+    showDebug("Jpeg to bitmap conversion time %ums", (uint32_t)millis()-mTime); 
     uint32_t cTime = millis(); 
     static uint16_t motionCnt = 0;
-    uint32_t lux = 0;
-
+    if(!bmpBuf) {
+      showError("failed jpg2rgb!")
+      return false;
+    }
     // calculate parameters for sample size
-    uint8_t downsize = pow(2, frameData[fsizePtr].scaleFactor) * frameData[fsizePtr].sampleRate;
-    uint8_t numCols = frameData[fsizePtr].frameWidth / downsize;
-    uint8_t numRows = frameData[fsizePtr].frameHeight / downsize;
+    uint8_t log2_downsize = frameData[fsizePtr].scaleFactor + log2(frameData[fsizePtr].sampleRate);
+    uint8_t numCols = frameData[fsizePtr].frameWidth >> log2_downsize; 
+    uint8_t numRows = frameData[fsizePtr].frameHeight >> log2_downsize;
     uint16_t pixelSpan = frameData[fsizePtr].sampleRate * RGB888_BYTES;
     uint16_t bitmapWidth = numCols * frameData[fsizePtr].sampleRate;
-    uint32_t col[numCols][RGB888_BYTES] = {0}; // total pixel values per color per column 
-    uint32_t row[numRows][RGB888_BYTES] = {0}; // total pixel values per color per row
     uint32_t numSamples = numCols * numRows;
-    showDebug("%u samples for %s", numSamples, frameData[fsizePtr].frameSizeStr);
- 
-    // get mass (pixel value) of each sampled pixel color and accumulate in row and column
-    for (int r=0; r<numRows; r++) {
-      for (int c=0; c<numCols; c++) {
-        uint32_t pixelPos = bmpOffset+((c+(r*bitmapWidth))*pixelSpan); // within bitmap buffer
-        for (uint32_t rgb=0; rgb<RGB888_BYTES; rgb++) {
-          // each pixel has RGB values
-          row[r][rgb] += bmpBuf[pixelPos+rgb]; 
-          col[c][rgb] += bmpBuf[pixelPos+rgb];
-          lux += bmpBuf[pixelPos+rgb];
-        }
-      }  
-    }
+    showInfo("%u samples for %s", numSamples, frameData[fsizePtr].frameSizeStr);
+    uint8_t *grayIm = (uint8_t*)ps_calloc(numSamples,1);
+    showDebug("image (%u x %u)  pixelSpan: %u, bitmapWidth: %u", numCols, numRows, pixelSpan, bitmapWidth);    
+    showDebug("* esp32-motion:");
+    showDebug("    - convert to grayscale..");
 
-    MotionEstContext *me_ctx {};
-    me_ctx->method = BLOCK_MATCHING_EPZS;
-    me_ctx->width = 1; me_ctx->height = 1;
-    me_ctx->mbSize = 6;
-    me_ctx->search_param = 9;
+    bmpBuf += bmpOffset; 
+    bmp2gray(grayIm, bmpBuf, numCols, numRows, pixelSpan, bitmapWidth);
 
+    // Init motion context at start or when framesize change
+    // In that case don't do motion_estimation because no previous
+    // image or image of diff size
+    if(first || numCols != me_ctx->width || numRows != me_ctx->height) {
+      me_ctx->method = BLOCK_MATCHING_EPZS;            // algo used. LK_OPTICAL_FLOW; <- good too
+      me_ctx->width = numCols;                         // image width
+      me_ctx->height = numRows;                        // image height
+      me_ctx->mbSize = 6;                              // MacroBlock size higher to remove noise, leaf motion,..
+      me_ctx->search_param = 9;                        // Higher value for faster movement => more research => slower
+      showDebug("    - init motion context ...")
+      init_context(me_ctx);                            // allocate mv_tables
+      first = false;
+      showDebug("Total heap: %d", ESP.getHeapSize());
+      showDebug("Free heap: %d", ESP.getFreeHeap());
+      showDebug("Total PSRAM: %d", ESP.getPsramSize());
+      showDebug("Free PSRAM: %d", ESP.getFreePsram());  
+    //in other cases Compute & save motion vectors in mv_tables[0]
+    } else if(!motion_estimation(me_ctx, grayIm, &prevGrayIm[0]))
+      showError("Motion estimation failed!");
 
-    // calculate image centre of mass
-    uint32_t cSum[RGB888_BYTES] = {0}; // total column sum per color
-    float cMass[RGB888_BYTES] = {0};  //  total weighted column sum (mass) per color
-    float cCOM[RGB888_BYTES] = {0}; // x axis centre of mass
-    float cCOMdiff[RGB888_BYTES] = {0}; // difference between current and previous x axis
-    static float cCOMprev[RGB888_BYTES] = {0}; // previous x axis centre of mass
-    uint32_t rSum[RGB888_BYTES] = {0}; // as above for rows / y axis
-    float rMass[RGB888_BYTES] = {0};
-    float rCOM[RGB888_BYTES] = {0};
-    float rCOMdiff[RGB888_BYTES] = {0};
-    static float rCOMprev[RGB888_BYTES] = {0};
-    
-    for (int rgb=0; rgb<RGB888_BYTES; rgb++) {
-      for (int r=0; r<numRows; r++) { 
-        // calculate total row sum and total row relative mass per color
-        rSum[rgb] += row[r][rgb];
-        rMass[rgb] += (row[r][rgb] * (r+1));
-      }
-      for (int c=0; c<numCols; c++) {
-        // calculate total col sum and total col relative mass per color
-        cSum[rgb] += col[c][rgb];
-        cMass[rgb] += (col[c][rgb] * (c+1));
-      }   
-      // calculate x and y centre of mass per color and difference to previous
-      cCOM[rgb] = cMass[rgb] / cSum[rgb];
-      cCOMdiff[rgb] = cCOM[rgb] - cCOMprev[rgb];
-      cCOMprev[rgb] = cCOM[rgb];
-      rCOM[rgb] = rMass[rgb] / rSum[rgb];
-      rCOMdiff[rgb] = rCOM[rgb] - rCOMprev[rgb];
-      rCOMprev[rgb] = rCOM[rgb];    
-    }
-    // get single x & y differences and percent change
-    float COMtot = 0;
-    float COMtotDiff = 0;
-    for (int rgb=0; rgb<RGB888_BYTES; rgb++) {
-      COMtot += (abs(cCOM[rgb])+abs(rCOM[rgb]));
-      COMtotDiff += (abs(cCOMdiff[rgb])+abs(rCOMdiff[rgb]));
-    }
-    float diffPcnt = (COMtotDiff*100)/COMtot; // total % difference between frames  
-    
-    lightLevel = (lux*100)/(numSamples*RGB888_BYTES*255); // light value as a %
-    showDebug("diffPcnt %0.2f%%, lux %u%%, %ums", diffPcnt, lightLevel, millis()-cTime);
+    showDebug("    - copy image buffer for next motion")
+    // Copy current image for next process as previous image
+    for (int i = numSamples; --i; ) 
+        prevGrayIm[i] = grayIm[i];
+    free(grayIm);  
 
+    showDebug("    - calculating change.." );
+    // Calculate mean/sum of vector mag2
+    int sum = 0;
+    MotionVector16_t *mv = me_ctx->mv_table[0];
+    // number of motion vector is w*h if LK else number of macroblock.
+    int nb_mv = (me_ctx->method == LK_OPTICAL_FLOW) ? numSamples : me_ctx->b_count;
+    for(int i = 0; i < nb_mv; i++, mv++) 
+        sum += (int) sqrtf(mv->mag2);
+
+    showInfo("time: %ums | tot change = %u pix | avg change = %u pix/vector", (uint32_t)millis()-cTime, 
+    (uint32_t)sum, (uint32_t)sum / nb_mv); 
+      
     // determine if movement has occurred
-    if (diffPcnt > (float)0.01*pow(2, 10-motionVal)) { //  min % shift to indicate movement
+    if (sum / nb_mv > 10 - motionVal) { 
       // sufficient centre of mass shift
       if (!motionStatus) motionCnt += 1;
-      showDebug("### Change detected");
+      showInfo("### Change detected");
       // need minimum sequence of changes to signal valid movement
       if (!motionStatus && motionCnt >= MOTION_SEQUENCE) {
-        showDebug("***** Motion - START");
+        showInfo("***** Motion - START");
         motionStatus = true; // motion started
       } 
     } else {
@@ -172,11 +178,11 @@ bool checkMotion(camera_fb_t* fb, bool motionStatus) {
       }
     }
     if (motionStatus) showDebug("*** Motion - ongoing");
-    showDebug("Total motion processing for frame %ums", millis()-mTime);
+    showDebug("Total motion processing for frame %ums", (uint32_t)millis()-mTime);
   } else showError("Image conversion failed");
 
   // esp32-cam issue #126
-  if (bmpBuf == NULL) showError("Memory leak, heap now: %u", xPortGetFreeHeapSize());
+  if (bmpBuf == NULL) showError("Memory leak, heap now: %u", (uint32_t)xPortGetFreeHeapSize());
   free(bmpBuf);
   bmpBuf = NULL;
   return motionStatus;
