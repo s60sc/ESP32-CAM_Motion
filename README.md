@@ -1,5 +1,7 @@
 # ESP32-CAM_Motion
 
+No longer maintained as `motionDetect.cpp` included with the [ESP32-CAM_MJPEG2SD](https://github.com/s60sc/ESP32-CAM_MJPEG2SD) repository is more effective.
+
 ESP32 Camera extension to allow the camera to detect movement using image centre of mass shift, whilst still retrieving large JPEG images.
 
 ## Purpose
